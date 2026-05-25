@@ -1,0 +1,143 @@
+openapi: 3.0.3
+info:
+  title: CaseCellShop API
+  version: 0.1.0
+  description: |
+    Mini-serviço backend para o desafio CaseCellShop.
+    Demonstra cache, idempotência, concorrência e checkout assíncrono.
+servers:
+  - url: http://localhost:3000
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+
+  /products:
+    get:
+      summary: Lista o catálogo de produtos (cacheado)
+      parameters:
+        - in: header
+          name: x-correlation-id
+          schema: { type: string }
+      responses:
+        '200':
+          description: Lista de produtos
+          headers:
+            X-Cache:
+              schema: { type: string, enum: [HIT, MISS] }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Product' }
+
+  /checkout:
+    post:
+      summary: Inicia checkout assíncrono
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string, format: uuid }
+        - in: header
+          name: x-correlation-id
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckoutRequest' }
+      responses:
+        '202':
+          description: Pedido aceito para processamento
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckoutAccepted' }
+        '409':
+          description: Estoque insuficiente
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '400':
+          description: Payload inválido
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /orders/{orderId}/status:
+    get:
+      summary: Consulta status de um pedido
+      parameters:
+        - in: path
+          name: orderId
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Status atual
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OrderStatus' }
+        '404':
+          description: Pedido não encontrado
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+components:
+  schemas:
+    Product:
+      type: object
+      required: [sku, name, price, available]
+      properties:
+        sku: { type: string, example: CAP-IP15-CLR }
+        name: { type: string, example: "Capinha iPhone 15 Transparente" }
+        price: { type: number, format: float, example: 49.90 }
+        available: { type: integer, example: 120 }
+
+    CheckoutRequest:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            required: [sku, quantity]
+            properties:
+              sku: { type: string }
+              quantity: { type: integer, minimum: 1 }
+
+    CheckoutAccepted:
+      type: object
+      required: [orderId, status]
+      properties:
+        orderId: { type: string, format: uuid }
+        status: { type: string, enum: [pending] }
+
+    OrderStatus:
+      type: object
+      required: [orderId, status]
+      properties:
+        orderId: { type: string, format: uuid }
+        status: { type: string, enum: [pending, confirmed, failed] }
+        erpInvoiceId: { type: string, nullable: true }
+        failedReason: { type: string, nullable: true }
+
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code: { type: string, example: insufficient_stock }
+        message: { type: string }
+        details: { type: object, additionalProperties: true }
