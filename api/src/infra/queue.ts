@@ -1,8 +1,7 @@
-import { Queue, QueueEvents } from 'bullmq';
+import { Queue } from 'bullmq';
 import { createBullConnection } from './redis.js';
 import { env } from '../config/env.js';
-import { logger } from '../observability/logger.js';
-import { dlqSize, queueJobsFailed } from '../observability/metrics.js';
+import { dlqSize, queueJobsWaiting, queueJobsActive } from '../observability/metrics.js';
 
 export const CHECKOUT_QUEUE = 'checkout';
 export const CHECKOUT_DLQ = 'checkout-dlq';
@@ -28,29 +27,17 @@ export const checkoutDlq = new Queue(CHECKOUT_DLQ, {
   },
 });
 
-const checkoutEvents = new QueueEvents(CHECKOUT_QUEUE, {
-  connection: createBullConnection(),
-});
-
-checkoutEvents.on('failed', async ({ jobId, failedReason }) => {
-  logger.warn({ jobId, failedReason }, 'checkout job failed');
-  queueJobsFailed.labels({ queue: CHECKOUT_QUEUE, reason: 'job_failed' }).inc();
-
-  const job = await checkoutQueue.getJob(jobId);
-  if (job && job.attemptsMade >= (job.opts.attempts ?? 1)) {
-    await checkoutDlq.add('dead', {
-      original: job.data,
-      failedReason,
-      attempts: job.attemptsMade,
-      timestamp: new Date().toISOString(),
-    });
-    logger.error({ jobId, attempts: job.attemptsMade }, 'job moved to DLQ');
-  }
-});
-
-checkoutEvents.on('completed', ({ jobId }) => {
-  logger.debug({ jobId }, 'checkout job completed');
-});
+/** Atualiza os gauges da fila — chamado sob demanda (ex.: /metrics scrape). */
+export async function refreshQueueGauges(): Promise<void> {
+  const [waiting, active, dlq] = await Promise.all([
+    checkoutQueue.getWaitingCount(),
+    checkoutQueue.getActiveCount(),
+    checkoutDlq.count(),
+  ]);
+  queueJobsWaiting.labels({ queue: CHECKOUT_QUEUE }).set(waiting);
+  queueJobsActive.labels({ queue: CHECKOUT_QUEUE }).set(active);
+  dlqSize.labels({ queue: CHECKOUT_QUEUE }).set(dlq);
+}
 
 export async function refreshDlqGauge(): Promise<void> {
   const size = await checkoutDlq.count();
@@ -58,7 +45,6 @@ export async function refreshDlqGauge(): Promise<void> {
 }
 
 export async function closeQueues(): Promise<void> {
-  await checkoutEvents.close();
   await checkoutQueue.close();
   await checkoutDlq.close();
 }

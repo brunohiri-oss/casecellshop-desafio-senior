@@ -6,6 +6,9 @@ import { httpRequestDuration } from './observability/metrics.js';
 import correlationPlugin from './observability/correlation.js';
 import healthRoutes from './routes/health.js';
 import metricsRoutes from './routes/metrics.js';
+import productsRoutes from './routes/products.js';
+import checkoutRoutes from './routes/checkout.js';
+import ordersRoutes from './routes/orders.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
@@ -56,6 +59,9 @@ export async function buildApp(): Promise<FastifyInstance> {
 
   await app.register(healthRoutes);
   await app.register(metricsRoutes);
+  await app.register(productsRoutes);
+  await app.register(checkoutRoutes);
+  await app.register(ordersRoutes);
 
   return app;
 }
