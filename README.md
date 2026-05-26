@@ -18,36 +18,41 @@ A solução endereça os 3 problemas do enunciado:
 
 ```mermaid
 flowchart LR
-  Client[Cliente HTTP]
-  subgraph API[Fastify API]
+  Client([Cliente HTTP])
+
+  subgraph API["Fastify API"]
     Routes[Routes<br/>products / checkout / orders / admin]
     Services[Services<br/>cache · checkout · fake-erp]
     Repos[Repositories<br/>products · stock · orders · idempotency · outbox]
   end
-  subgraph Redis[(Redis)]
-    Cache[products:list:v1]
-    Lock[single-flight lock]
-    Queue[BullMQ: checkout + DLQ]
+
+  subgraph RedisGroup["Redis"]
+    Cache[(products:list:v1)]
+    Lock[(single-flight lock)]
+    Queue[(BullMQ: checkout + DLQ)]
   end
-  subgraph Postgres[(Postgres)]
-    Products[products]
-    Orders[orders]
-    Idem[idempotency_keys]
-    Outbox[outbox_events]
+
+  subgraph PgGroup["Postgres"]
+    Products[(products)]
+    Orders[(orders)]
+    Idem[(idempotency_keys)]
+    Outbox[(outbox_events)]
   end
+
   Worker[Checkout Worker<br/>retry exponencial + DLQ]
   ERPstub[fake-erp<br/>latência+falha simuladas]
 
   Client -->|GET /products| Routes
   Client -->|POST /checkout| Routes
   Client -->|GET /orders/:id/status| Routes
-  Routes --> Services --> Repos
-  Services -- read/write cache + enqueue --> Redis
-  Repos --> Postgres
+  Routes --> Services
+  Services --> Repos
+  Services -->|cache + enqueue| RedisGroup
+  Repos --> PgGroup
   Queue --> Worker
   Worker -->|invoice| ERPstub
-  Worker -->|markConfirmed / markFailed| Postgres
-  Worker -->|exhausted| Queue
+  Worker -->|markConfirmed / markFailed| PgGroup
+  Worker -.->|exhausted| Queue
 ```
 
 **Observabilidade já integrada ao fluxo:**
