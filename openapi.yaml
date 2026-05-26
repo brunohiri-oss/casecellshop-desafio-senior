@@ -3,38 +3,64 @@ info:
   title: CaseCellShop API
   version: 0.1.0
   description: |
-    Mini-serviço backend para o desafio CaseCellShop.
-    Demonstra cache, idempotência, concorrência e checkout assíncrono.
+    Mini-serviço backend para o desafio CaseCellShop Senior.
+
+    Demonstra:
+    - cache-aside com single-flight (anti-stampede) em `GET /products`
+    - reserva atômica de estoque + idempotency-key em `POST /checkout`
+    - status assíncrono em `GET /orders/{orderId}/status`
+    - inspeção operacional da DLQ em `GET /admin/dlq`
+
 servers:
   - url: http://localhost:3000
 
 paths:
   /health:
     get:
-      summary: Health check
+      summary: Health check (db + redis)
       responses:
         '200':
-          description: Service healthy
+          description: Healthy
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  status: { type: string, example: ok }
+              schema: { $ref: '#/components/schemas/Health' }
+        '503':
+          description: Degraded — alguma dependência fora
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      responses:
+        '200':
+          description: Exposição de métricas formato Prometheus
+          content:
+            text/plain: {}
 
   /products:
     get:
-      summary: Lista o catálogo de produtos (cacheado)
+      summary: Lista o catálogo (cacheado, TTL configurável)
+      description: |
+        Cache-aside no Redis com single-flight lock para prevenir stampede.
+        O header `X-Cache` indica HIT ou MISS.
       parameters:
         - in: header
           name: x-correlation-id
+          required: false
           schema: { type: string }
+          description: Propaga correlation ID para logs e traces.
       responses:
         '200':
-          description: Lista de produtos
+          description: Lista de produtos disponíveis
           headers:
             X-Cache:
+              description: HIT (servido do cache) ou MISS (carregado do banco)
               schema: { type: string, enum: [HIT, MISS] }
+            x-correlation-id:
+              description: Eco do correlation ID
+              schema: { type: string }
           content:
             application/json:
               schema:
@@ -44,13 +70,23 @@ paths:
   /checkout:
     post:
       summary: Inicia checkout assíncrono
+      description: |
+        Idempotente via header `Idempotency-Key`. Reserva estoque atomicamente
+        e enfileira o job para o worker processar (faturamento no ERP).
+        Retorna `202 Accepted` com `orderId` para acompanhamento via
+        `GET /orders/{orderId}/status`.
       parameters:
         - in: header
           name: Idempotency-Key
           required: true
           schema: { type: string, format: uuid }
+          description: |
+            UUID que identifica unicamente esta intenção de compra.
+            Reuso com o mesmo body retorna a mesma resposta (replay seguro
+            para retry/duplo clique).
         - in: header
           name: x-correlation-id
+          required: false
           schema: { type: string }
       requestBody:
         required: true
@@ -59,17 +95,29 @@ paths:
             schema: { $ref: '#/components/schemas/CheckoutRequest' }
       responses:
         '202':
-          description: Pedido aceito para processamento
+          description: Pedido aceito, processamento assíncrono iniciado
+          headers:
+            X-Idempotent-Replay:
+              description: Presente como "true" quando é um replay da mesma key
+              schema: { type: string }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/CheckoutAccepted' }
-        '409':
-          description: Estoque insuficiente
+        '400':
+          description: Payload ou Idempotency-Key inválido
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '400':
-          description: Payload inválido
+        '409':
+          description: |
+            Conflito — estoque insuficiente (`insufficient_stock`), SKU desconhecido
+            (`unknown_sku`) ou request com mesma key ainda em processamento
+            (`request_in_progress`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: Idempotency-Key reusada com payload diferente
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -84,18 +132,80 @@ paths:
           schema: { type: string, format: uuid }
       responses:
         '200':
-          description: Status atual
+          description: Status atual do pedido
           content:
             application/json:
               schema: { $ref: '#/components/schemas/OrderStatus' }
+        '400':
+          description: orderId inválido (não-UUID)
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: Pedido não encontrado
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /admin/dlq:
+    get:
+      summary: Inspeciona a DLQ (Dead Letter Queue)
+      description: |
+        Primeira chamada do runbook quando `dlq_size > 0`. Retorna payload
+        completo dos jobs que esgotaram retries, incluindo o `traceparent`
+        do trace original para correlação forense.
+        **Em produção exige autenticação dedicada — aqui aberto por simplificação.**
+      parameters:
+        - in: query
+          name: limit
+          required: false
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+      responses:
+        '200':
+          description: Conteúdo da DLQ
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [queue, size, items]
+                properties:
+                  queue: { type: string, example: checkout-dlq }
+                  size: { type: integer }
+                  items:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id: { type: string }
+                        timestamp: { type: integer }
+                        attemptsMade: { type: integer }
+                        data:
+                          type: object
+                          properties:
+                            original: { type: object, additionalProperties: true }
+                            failedReason: { type: string }
+                            attempts: { type: integer }
+                            timestamp: { type: string, format: date-time }
+
+  /admin/queue/gauges/refresh:
+    post:
+      summary: Força atualização dos gauges da fila (debug)
+      responses:
+        '204': { description: Gauges atualizados }
+
 components:
   schemas:
+    Health:
+      type: object
+      required: [status, checks]
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        checks:
+          type: object
+          properties:
+            db: { type: boolean }
+            redis: { type: boolean }
+
     Product:
       type: object
       required: [sku, name, price, available]
@@ -111,11 +221,12 @@ components:
       properties:
         items:
           type: array
+          minItems: 1
           items:
             type: object
             required: [sku, quantity]
             properties:
-              sku: { type: string }
+              sku: { type: string, minLength: 1 }
               quantity: { type: integer, minimum: 1 }
 
     CheckoutAccepted:
@@ -127,7 +238,7 @@ components:
 
     OrderStatus:
       type: object
-      required: [orderId, status]
+      required: [orderId, status, erpInvoiceId, failedReason]
       properties:
         orderId: { type: string, format: uuid }
         status: { type: string, enum: [pending, confirmed, failed] }
@@ -138,6 +249,18 @@ components:
       type: object
       required: [code, message]
       properties:
-        code: { type: string, example: insufficient_stock }
+        code:
+          type: string
+          enum:
+            - invalid_payload
+            - invalid_idempotency_key
+            - invalid_order_id
+            - insufficient_stock
+            - unknown_sku
+            - request_in_progress
+            - idempotency_key_reused_with_different_payload
+            - order_not_found
+            - internal_error
         message: { type: string }
-        details: { type: object, additionalProperties: true }
+        sku: { type: string, nullable: true }
+        details: { type: object, additionalProperties: true, nullable: true }

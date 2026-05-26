@@ -17,6 +17,7 @@ import {
   releaseIdempotencyOnError,
   type IdempotencyRow,
 } from '../repositories/idempotency.js';
+import type { ReserveResult } from '../repositories/stock.js';
 import { insertOrderTx } from '../repositories/orders.js';
 import { insertOutboxEventTx, markOutboxPublished } from '../repositories/outbox.js';
 import { reserveStockTx, type CheckoutItem } from '../repositories/stock.js';
@@ -43,6 +44,13 @@ function hashBody(items: CheckoutItem[]): string {
     .map((i) => ({ sku: i.sku, quantity: i.quantity }))
     .sort((a, b) => a.sku.localeCompare(b.sku));
   return createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+}
+
+class InsufficientStockError extends Error {
+  constructor(public readonly reason: 'insufficient_stock' | 'unknown_sku', public readonly sku: string) {
+    super(`cannot fulfill sku ${sku}: ${reason}`);
+    this.name = 'InsufficientStockError';
+  }
 }
 
 export async function processCheckout(input: CheckoutInput): Promise<CheckoutResult> {
@@ -95,11 +103,12 @@ export async function processCheckout(input: CheckoutInput): Promise<CheckoutRes
       const orderId = randomUUID();
       rootSpan.setAttribute('order.id', orderId);
 
+      let txResult: { orderId: string; outboxId: string };
       try {
-        const txResult = await withSpan('checkout.tx', { 'order.id': orderId }, () =>
+        txResult = await withSpan('checkout.tx', { 'order.id': orderId }, () =>
           withTx(async (client) => {
             const reserveStart = Date.now();
-            const reserve = await withSpan(
+            const reserve: ReserveResult = await withSpan(
               'stock.reserve',
               { 'order.id': orderId },
               () => reserveStockTx(client, input.items)
@@ -108,22 +117,11 @@ export async function processCheckout(input: CheckoutInput): Promise<CheckoutRes
               .labels({ phase: 'reserve_stock' })
               .observe((Date.now() - reserveStart) / 1000);
 
+            // CRÍTICO: ao falhar a reserva, LANÇAMOS exceção para forçar ROLLBACK.
+            // Retornar { kind: 'rejected' } daqui faria withTx COMMITAR, deixando
+            // decrementos parciais persistidos em ordens multi-item.
             if (!reserve.ok) {
-              stockReserveConflicts.labels({ sku: reserve.sku }).inc();
-              rootSpan.setAttribute('checkout.outcome', `rejected_${reserve.reason}`);
-              rootSpan.setAttribute('stock.failed_sku', reserve.sku);
-              const body = {
-                code: reserve.reason,
-                message: `cannot fulfill sku ${reserve.sku}`,
-                sku: reserve.sku,
-              };
-              await completeIdempotencyTx(client, {
-                key: input.idempotencyKey,
-                orderId: null,
-                responseBody: body,
-                responseCode: 409,
-              });
-              return { kind: 'rejected' as const, reason: reserve.reason, sku: reserve.sku };
+              throw new InsufficientStockError(reserve.reason, reserve.sku);
             }
 
             await insertOrderTx(client, {
@@ -144,48 +142,60 @@ export async function processCheckout(input: CheckoutInput): Promise<CheckoutRes
               responseBody,
               responseCode: 202,
             });
-            return { kind: 'accepted' as const, orderId, outboxId };
+            return { orderId, outboxId };
           })
         );
-
-        if (txResult.kind === 'rejected') {
-          return { kind: 'rejected', code: txResult.reason, sku: txResult.sku, httpStatus: 409 };
-        }
-
-        // 3. Pós-commit: enfileira job. Se falhar, evento fica no outbox como 'pending'
-        //    e seria reprocessado por um outbox publisher (não implementado neste escopo).
-        const enqueueStart = Date.now();
-        await withSpan('queue.enqueue', { 'queue.name': CHECKOUT_QUEUE, 'order.id': orderId }, async () => {
-          try {
-            await checkoutQueue.add(
-              'checkout',
-              {
-                orderId: txResult.orderId,
-                items: input.items,
-                correlationId: input.correlationId,
-                _otel: injectContext(),
-              },
-              { jobId: txResult.orderId } // jobId = orderId garante idempotência no enqueue
-            );
-            await markOutboxPublished(txResult.outboxId);
-          } catch (err) {
-            log.error(
-              { err, orderId: txResult.orderId },
-              'enqueue failed; outbox event remains pending'
-            );
-          }
-        });
-        checkoutDuration.labels({ phase: 'enqueue' }).observe((Date.now() - enqueueStart) / 1000);
-
-        rootSpan.setAttribute('checkout.outcome', 'accepted');
-        checkoutStarted.inc();
-        log.info({ orderId: txResult.orderId, queue: CHECKOUT_QUEUE }, 'checkout accepted');
-        return { kind: 'accepted', orderId: txResult.orderId, status: 'pending', replay: false };
       } catch (err) {
+        if (err instanceof InsufficientStockError) {
+          // Tx foi rolled back — estoque restaurado.
+          // Agora persistimos a falha na tabela de idempotência em tx separada,
+          // para que replay retorne 409 sem reprocessar.
+          stockReserveConflicts.labels({ sku: err.sku }).inc();
+          rootSpan.setAttribute('checkout.outcome', `rejected_${err.reason}`);
+          rootSpan.setAttribute('stock.failed_sku', err.sku);
+          const body = { code: err.reason, message: err.message, sku: err.sku };
+          await completeIdempotency({
+            key: input.idempotencyKey,
+            orderId: null,
+            responseBody: body,
+            responseCode: 409,
+          });
+          return { kind: 'rejected', code: err.reason, sku: err.sku, httpStatus: 409 };
+        }
         log.error({ err }, 'checkout processing failed; releasing idempotency key');
         await releaseIdempotencyOnError(input.idempotencyKey);
         throw err;
       }
+
+      // 3. Pós-commit: enfileira job. Se falhar, evento fica no outbox como 'pending'
+      //    e seria reprocessado por um outbox publisher (não implementado neste escopo).
+      const enqueueStart = Date.now();
+      await withSpan('queue.enqueue', { 'queue.name': CHECKOUT_QUEUE, 'order.id': orderId }, async () => {
+        try {
+          await checkoutQueue.add(
+            'checkout',
+            {
+              orderId: txResult.orderId,
+              items: input.items,
+              correlationId: input.correlationId,
+              _otel: injectContext(),
+            },
+            { jobId: txResult.orderId } // jobId = orderId garante idempotência no enqueue
+          );
+          await markOutboxPublished(txResult.outboxId);
+        } catch (err) {
+          log.error(
+            { err, orderId: txResult.orderId },
+            'enqueue failed; outbox event remains pending'
+          );
+        }
+      });
+      checkoutDuration.labels({ phase: 'enqueue' }).observe((Date.now() - enqueueStart) / 1000);
+
+      rootSpan.setAttribute('checkout.outcome', 'accepted');
+      checkoutStarted.inc();
+      log.info({ orderId: txResult.orderId, queue: CHECKOUT_QUEUE }, 'checkout accepted');
+      return { kind: 'accepted', orderId: txResult.orderId, status: 'pending', replay: false };
     }
   );
 }
