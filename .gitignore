@@ -8,3 +8,8 @@ coverage/
 .idea/
 .vscode/
 .commit-msg.tmp
+# Tooling local para gerar PDF: script + node_modules + HTML intermediário
+# ficam fora do repo; só o PDF final fica commitado na raiz.
+tools/pdf/node_modules/
+tools/pdf/respostas.html
+tools/pdf/pnpm-lock.yaml

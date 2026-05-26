@@ -2,6 +2,9 @@
 
 Solução de referência para o desafio técnico **CaseCellShop**, modelando um e-commerce em hipercrescimento acoplado a um ERP legado lento.
 
+> **Parte 1.A — respostas conceituais consolidadas em PDF:** [`Respostas-CaseCellShop.pdf`](./Respostas-CaseCellShop.pdf) (também disponível em markdown formatado em [`docs/RESPOSTAS.md`](./docs/RESPOSTAS.md)).
+> **Parte 1.B — mini-tarefa prática:** este repositório.
+
 A solução endereça os 3 problemas do enunciado:
 
 | # | Problema do enunciado | Como esta solução resolve |
