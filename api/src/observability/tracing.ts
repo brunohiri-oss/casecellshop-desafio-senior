@@ -6,7 +6,14 @@ import { HttpInstrumentation } from '@opentelemetry/instrumentation-http';
 import { FastifyInstrumentation } from '@opentelemetry/instrumentation-fastify';
 import { PgInstrumentation } from '@opentelemetry/instrumentation-pg';
 import { IORedisInstrumentation } from '@opentelemetry/instrumentation-ioredis';
-import { trace } from '@opentelemetry/api';
+import {
+  trace,
+  context,
+  propagation,
+  SpanStatusCode,
+  type Span,
+  type Context,
+} from '@opentelemetry/api';
 import { env } from '../config/env.js';
 
 let sdk: NodeSDK | null = null;
@@ -39,3 +46,52 @@ export async function stopTracing(): Promise<void> {
 }
 
 export const tracer = trace.getTracer('casecellshop-api');
+
+/**
+ * Wrapper para spans manuais que cuida de:
+ *  - registrar erro no span (recordException + status ERROR) e rethrow;
+ *  - sempre fechar o span (try/finally).
+ */
+export async function withSpan<T>(
+  name: string,
+  attrs: Record<string, string | number | boolean | undefined>,
+  fn: (span: Span) => Promise<T>
+): Promise<T> {
+  return tracer.startActiveSpan(name, async (span) => {
+    setAttrs(span, attrs);
+    try {
+      return await fn(span);
+    } catch (err) {
+      span.recordException(err as Error);
+      span.setStatus({ code: SpanStatusCode.ERROR, message: (err as Error).message });
+      throw err;
+    } finally {
+      span.end();
+    }
+  });
+}
+
+export function setAttrs(span: Span, attrs: Record<string, string | number | boolean | undefined>): void {
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v !== undefined) span.setAttribute(k, v);
+  }
+}
+
+/**
+ * Captura o contexto OTel atual num objeto serializável (W3C Trace Context),
+ * para anexar ao payload do job e propagar até o worker.
+ */
+export function injectContext(): Record<string, string> {
+  const carrier: Record<string, string> = {};
+  propagation.inject(context.active(), carrier);
+  return carrier;
+}
+
+/** Extrai contexto OTel de um carrier (job data) para usar como pai do span do worker. */
+export function extractContext(carrier: Record<string, string> | undefined): Context {
+  if (!carrier) return context.active();
+  return propagation.extract(context.active(), carrier);
+}
+
+export { context, SpanStatusCode };
+

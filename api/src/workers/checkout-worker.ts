@@ -15,45 +15,73 @@ import {
 } from '../observability/metrics.js';
 import { invoiceOrder } from '../services/fake-erp.js';
 import { markOrderConfirmed, markOrderFailed } from '../repositories/orders.js';
+import { tracer, withSpan, extractContext, context as otelContext } from '../observability/tracing.js';
 
 interface CheckoutJobData {
   orderId: string;
   items: Array<{ sku: string; quantity: number }>;
   correlationId: string;
+  _otel?: Record<string, string>;
 }
 
 const worker = new Worker<CheckoutJobData>(
   CHECKOUT_QUEUE,
   async (job: Job<CheckoutJobData>) => {
-    const start = Date.now();
-    const log = logger.child({
-      correlationId: job.data.correlationId,
-      orderId: job.data.orderId,
-      jobId: job.id,
-      attempt: job.attemptsMade + 1,
+    // Restaura o contexto OTel injetado no enqueue para que o span do worker
+    // apareça como continuação do mesmo trace iniciado em POST /checkout.
+    const parentCtx = extractContext(job.data._otel);
+    return otelContext.with(parentCtx, async () => {
+      return withSpan(
+        'worker.process',
+        {
+          'order.id': job.data.orderId,
+          'queue.job_id': job.id ?? '',
+          'queue.attempt': job.attemptsMade + 1,
+          'correlation.id': job.data.correlationId,
+        },
+        async (span) => {
+          const start = Date.now();
+          const log = logger.child({
+            correlationId: job.data.correlationId,
+            orderId: job.data.orderId,
+            jobId: job.id,
+            attempt: job.attemptsMade + 1,
+          });
+          log.info('processing checkout job');
+
+          if (job.attemptsMade > 0) {
+            queueRetries.labels({ queue: CHECKOUT_QUEUE }).inc();
+          }
+
+          const erpStart = Date.now();
+          const { erpInvoiceId } = await withSpan(
+            'erp.invoice',
+            { 'order.id': job.data.orderId },
+            () => invoiceOrder({ orderId: job.data.orderId, items: job.data.items })
+          );
+          checkoutDuration.labels({ phase: 'erp_call' }).observe((Date.now() - erpStart) / 1000);
+
+          await withSpan(
+            'orders.mark_confirmed',
+            { 'order.id': job.data.orderId, 'erp.invoice_id': erpInvoiceId },
+            () => markOrderConfirmed(job.data.orderId, erpInvoiceId)
+          );
+
+          checkoutCompleted.labels({ outcome: 'confirmed' }).inc();
+          checkoutDuration.labels({ phase: 'worker' }).observe((Date.now() - start) / 1000);
+          span.setAttribute('erp.invoice_id', erpInvoiceId);
+
+          log.info({ erpInvoiceId }, 'order confirmed');
+          return { erpInvoiceId };
+        }
+      );
     });
-    log.info('processing checkout job');
-
-    if (job.attemptsMade > 0) {
-      queueRetries.labels({ queue: CHECKOUT_QUEUE }).inc();
-    }
-
-    const erpStart = Date.now();
-    const { erpInvoiceId } = await invoiceOrder({
-      orderId: job.data.orderId,
-      items: job.data.items,
-    });
-    checkoutDuration.labels({ phase: 'erp_call' }).observe((Date.now() - erpStart) / 1000);
-
-    await markOrderConfirmed(job.data.orderId, erpInvoiceId);
-    checkoutCompleted.labels({ outcome: 'confirmed' }).inc();
-    checkoutDuration.labels({ phase: 'worker' }).observe((Date.now() - start) / 1000);
-
-    log.info({ erpInvoiceId }, 'order confirmed');
-    return { erpInvoiceId };
   },
   { connection: createBullConnection(), concurrency: 5 }
 );
+
+// Silencia "unused" do tracer (importado para keep o módulo carregado).
+void tracer;
 
 worker.on('ready', () => logger.info({ queue: CHECKOUT_QUEUE }, 'worker ready'));
 worker.on('error', (err) => logger.error({ err }, 'worker error'));

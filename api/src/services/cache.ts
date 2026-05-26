@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { redis } from '../infra/redis.js';
 import { cacheHits, cacheMisses, cacheLockWait, cacheValueAge } from '../observability/metrics.js';
 import { logger } from '../observability/logger.js';
+import { withSpan } from '../observability/tracing.js';
 
 interface CacheEnvelope<T> {
   v: T;
@@ -60,56 +61,62 @@ async function storeValue<T>(key: string, value: T, ttlSeconds: number): Promise
 export async function getWithSingleFlight<T>(opts: SingleFlightOptions<T>): Promise<CacheResult<T>> {
   const { key, keyPrefix, ttlSeconds, lockTtlSeconds, loader, maxWaitMs = 2000 } = opts;
 
-  const initial = await tryGet<T>(key, keyPrefix);
-  if (initial) {
-    cacheHits.labels({ key_prefix: keyPrefix }).inc();
-    return { value: initial.v, status: 'hit' };
-  }
-  cacheMisses.labels({ key_prefix: keyPrefix }).inc();
-
-  const lockKey = `lock:${key}`;
-  const lockToken = randomUUID();
-  const acquired = await redis.set(lockKey, lockToken, 'EX', lockTtlSeconds, 'NX');
-
-  if (acquired === 'OK') {
-    try {
-      const value = await loader();
-      await storeValue(key, value, ttlSeconds);
-      return { value, status: 'computed' };
-    } finally {
-      // Lua script: só libera o lock se o token for nosso (evita liberar lock alheio
-      // se nossa operação demorou e o lock expirou).
-      const releaseScript = `
-        if redis.call("get", KEYS[1]) == ARGV[1] then
-          return redis.call("del", KEYS[1])
-        else
-          return 0
-        end`;
-      await redis.eval(releaseScript, 1, lockKey, lockToken).catch((err) => {
-        logger.warn({ err, lockKey }, 'lock release failed (likely expired)');
-      });
+  return withSpan('cache.get', { 'cache.key': key, 'cache.key_prefix': keyPrefix }, async (span) => {
+    const initial = await tryGet<T>(key, keyPrefix);
+    if (initial) {
+      cacheHits.labels({ key_prefix: keyPrefix }).inc();
+      span.setAttribute('cache.status', 'hit');
+      return { value: initial.v, status: 'hit' as const };
     }
-  }
+    cacheMisses.labels({ key_prefix: keyPrefix }).inc();
+    span.setAttribute('cache.status', 'miss');
 
-  // Lock detido por outra request — aguardar
-  const waitStart = Date.now();
-  const backoffBase = 50;
-  let attempt = 0;
-  while (Date.now() - waitStart < maxWaitMs) {
-    await sleep(backoffBase + Math.random() * backoffBase * attempt);
-    const cached = await tryGet<T>(key, keyPrefix);
-    if (cached) {
-      cacheLockWait.labels({ key_prefix: keyPrefix }).observe((Date.now() - waitStart) / 1000);
-      return { value: cached.v, status: 'hit' };
+    const lockKey = `lock:${key}`;
+    const lockToken = randomUUID();
+    const acquired = await redis.set(lockKey, lockToken, 'EX', lockTtlSeconds, 'NX');
+
+    if (acquired === 'OK') {
+      span.setAttribute('cache.lock', 'acquired');
+      try {
+        const value = await withSpan('cache.loader', { 'cache.key_prefix': keyPrefix }, () =>
+          loader()
+        );
+        await storeValue(key, value, ttlSeconds);
+        return { value, status: 'computed' as const };
+      } finally {
+        const releaseScript = `
+          if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+          else
+            return 0
+          end`;
+        await redis.eval(releaseScript, 1, lockKey, lockToken).catch((err) => {
+          logger.warn({ err, lockKey }, 'lock release failed (likely expired)');
+        });
+      }
     }
-    attempt++;
-  }
 
-  // Esgotamos o tempo de espera — modo degradado: rodar o loader nós mesmos.
-  cacheLockWait.labels({ key_prefix: keyPrefix }).observe((Date.now() - waitStart) / 1000);
-  logger.warn({ key }, 'single-flight wait timed out, falling through to loader');
-  const value = await loader();
-  return { value, status: 'computed' };
+    span.setAttribute('cache.lock', 'waiting');
+    const waitStart = Date.now();
+    const backoffBase = 50;
+    let attempt = 0;
+    while (Date.now() - waitStart < maxWaitMs) {
+      await sleep(backoffBase + Math.random() * backoffBase * attempt);
+      const cached = await tryGet<T>(key, keyPrefix);
+      if (cached) {
+        cacheLockWait.labels({ key_prefix: keyPrefix }).observe((Date.now() - waitStart) / 1000);
+        span.setAttribute('cache.status', 'hit_after_wait');
+        return { value: cached.v, status: 'hit' as const };
+      }
+      attempt++;
+    }
+
+    cacheLockWait.labels({ key_prefix: keyPrefix }).observe((Date.now() - waitStart) / 1000);
+    span.setAttribute('cache.lock', 'wait_timeout');
+    logger.warn({ key }, 'single-flight wait timed out, falling through to loader');
+    const value = await loader();
+    return { value, status: 'computed' as const };
+  });
 }
 
 /** Invalidação ativa (ex.: chamada por sync do ERP quando preço/estoque muda). */

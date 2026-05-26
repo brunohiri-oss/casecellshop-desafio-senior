@@ -5,9 +5,11 @@ import { checkoutQueue, CHECKOUT_QUEUE } from '../infra/queue.js';
 import { logger } from '../observability/logger.js';
 import {
   checkoutStarted,
+  checkoutDuration,
   checkoutIdempotencyReplays,
   stockReserveConflicts,
 } from '../observability/metrics.js';
+import { withSpan, injectContext } from '../observability/tracing.js';
 import {
   claimIdempotencyKey,
   completeIdempotencyTx,
@@ -44,102 +46,148 @@ function hashBody(items: CheckoutItem[]): string {
 }
 
 export async function processCheckout(input: CheckoutInput): Promise<CheckoutResult> {
-  const log = logger.child({
-    correlationId: input.correlationId,
-    idempotencyKey: input.idempotencyKey,
-  });
-  const requestHash = hashBody(input.items);
-
-  // 1. Idempotência — claim ou replay
-  const claim = await claimIdempotencyKey({
-    key: input.idempotencyKey,
-    requestHash,
-    ttlHours: env.IDEMPOTENCY_TTL_HOURS,
-  });
-
-  if (claim.outcome === 'replay') {
-    checkoutIdempotencyReplays.inc();
-    log.info({ orderId: claim.existing.order_id }, 'idempotency replay');
-    return replayResult(claim.existing);
-  }
-  if (claim.outcome === 'hash_mismatch') {
-    log.warn('idempotency hash mismatch');
-    return { kind: 'hash_mismatch', httpStatus: 422 };
-  }
-  if (claim.outcome === 'in_progress') {
-    log.info('idempotent request still in progress');
-    return { kind: 'in_progress', httpStatus: 409 };
-  }
-
-  // 2. Claimed — processar de fato.
-  const orderId = randomUUID();
-
-  try {
-    const txResult = await withTx(async (client) => {
-      const reserve = await reserveStockTx(client, input.items);
-      if (!reserve.ok) {
-        stockReserveConflicts.labels({ sku: reserve.sku }).inc();
-        const body = { code: reserve.reason, message: `cannot fulfill sku ${reserve.sku}`, sku: reserve.sku };
-        await completeIdempotencyTx(client, {
-          key: input.idempotencyKey,
-          orderId: null,
-          responseBody: body,
-          responseCode: 409,
-        });
-        return { kind: 'rejected' as const, reason: reserve.reason, sku: reserve.sku };
-      }
-
-      await insertOrderTx(client, {
-        id: orderId,
-        items: input.items,
+  return withSpan(
+    'checkout.process',
+    {
+      'idempotency.key': input.idempotencyKey,
+      'correlation.id': input.correlationId,
+      'checkout.item_count': input.items.length,
+    },
+    async (rootSpan) => {
+      const log = logger.child({
+        correlationId: input.correlationId,
         idempotencyKey: input.idempotencyKey,
       });
+      const requestHash = hashBody(input.items);
 
-      const outboxId = await insertOutboxEventTx(client, {
-        eventType: 'checkout.requested',
-        payload: { orderId, items: input.items, correlationId: input.correlationId },
-      });
-
-      const responseBody = { orderId, status: 'pending' };
-      await completeIdempotencyTx(client, {
-        key: input.idempotencyKey,
-        orderId,
-        responseBody,
-        responseCode: 202,
-      });
-      return { kind: 'accepted' as const, orderId, outboxId };
-    });
-
-    if (txResult.kind === 'rejected') {
-      return { kind: 'rejected', code: txResult.reason, sku: txResult.sku, httpStatus: 409 };
-    }
-
-    // 3. Pós-commit: enfileira job. Se falhar, evento fica no outbox como 'pending'
-    //    e seria reprocessado por um outbox publisher (não implementado neste escopo).
-    try {
-      await checkoutQueue.add(
-        'checkout',
-        {
-          orderId: txResult.orderId,
-          items: input.items,
-          correlationId: input.correlationId,
-        },
-        { jobId: txResult.orderId } // jobId = orderId garante idempotência no enqueue
+      // 1. Idempotência — claim ou replay
+      const claim = await withSpan(
+        'idempotency.claim',
+        { 'idempotency.key': input.idempotencyKey },
+        async (span) => {
+          const c = await claimIdempotencyKey({
+            key: input.idempotencyKey,
+            requestHash,
+            ttlHours: env.IDEMPOTENCY_TTL_HOURS,
+          });
+          span.setAttribute('idempotency.outcome', c.outcome);
+          return c;
+        }
       );
-      await markOutboxPublished(txResult.outboxId);
-    } catch (err) {
-      log.error({ err, orderId: txResult.orderId }, 'enqueue failed; outbox event remains pending');
-      // Mesmo se enqueue falhar, retornamos 202 — o outbox publisher resolveria.
-    }
 
-    checkoutStarted.inc();
-    log.info({ orderId: txResult.orderId, queue: CHECKOUT_QUEUE }, 'checkout accepted');
-    return { kind: 'accepted', orderId: txResult.orderId, status: 'pending', replay: false };
-  } catch (err) {
-    log.error({ err }, 'checkout processing failed; releasing idempotency key');
-    await releaseIdempotencyOnError(input.idempotencyKey);
-    throw err;
-  }
+      rootSpan.setAttribute('idempotency.outcome', claim.outcome);
+
+      if (claim.outcome === 'replay') {
+        checkoutIdempotencyReplays.inc();
+        log.info({ orderId: claim.existing.order_id }, 'idempotency replay');
+        return replayResult(claim.existing);
+      }
+      if (claim.outcome === 'hash_mismatch') {
+        log.warn('idempotency hash mismatch');
+        return { kind: 'hash_mismatch', httpStatus: 422 };
+      }
+      if (claim.outcome === 'in_progress') {
+        log.info('idempotent request still in progress');
+        return { kind: 'in_progress', httpStatus: 409 };
+      }
+
+      // 2. Claimed — processar de fato.
+      const orderId = randomUUID();
+      rootSpan.setAttribute('order.id', orderId);
+
+      try {
+        const txResult = await withSpan('checkout.tx', { 'order.id': orderId }, () =>
+          withTx(async (client) => {
+            const reserveStart = Date.now();
+            const reserve = await withSpan(
+              'stock.reserve',
+              { 'order.id': orderId },
+              () => reserveStockTx(client, input.items)
+            );
+            checkoutDuration
+              .labels({ phase: 'reserve_stock' })
+              .observe((Date.now() - reserveStart) / 1000);
+
+            if (!reserve.ok) {
+              stockReserveConflicts.labels({ sku: reserve.sku }).inc();
+              rootSpan.setAttribute('checkout.outcome', `rejected_${reserve.reason}`);
+              rootSpan.setAttribute('stock.failed_sku', reserve.sku);
+              const body = {
+                code: reserve.reason,
+                message: `cannot fulfill sku ${reserve.sku}`,
+                sku: reserve.sku,
+              };
+              await completeIdempotencyTx(client, {
+                key: input.idempotencyKey,
+                orderId: null,
+                responseBody: body,
+                responseCode: 409,
+              });
+              return { kind: 'rejected' as const, reason: reserve.reason, sku: reserve.sku };
+            }
+
+            await insertOrderTx(client, {
+              id: orderId,
+              items: input.items,
+              idempotencyKey: input.idempotencyKey,
+            });
+
+            const outboxId = await insertOutboxEventTx(client, {
+              eventType: 'checkout.requested',
+              payload: { orderId, items: input.items, correlationId: input.correlationId },
+            });
+
+            const responseBody = { orderId, status: 'pending' };
+            await completeIdempotencyTx(client, {
+              key: input.idempotencyKey,
+              orderId,
+              responseBody,
+              responseCode: 202,
+            });
+            return { kind: 'accepted' as const, orderId, outboxId };
+          })
+        );
+
+        if (txResult.kind === 'rejected') {
+          return { kind: 'rejected', code: txResult.reason, sku: txResult.sku, httpStatus: 409 };
+        }
+
+        // 3. Pós-commit: enfileira job. Se falhar, evento fica no outbox como 'pending'
+        //    e seria reprocessado por um outbox publisher (não implementado neste escopo).
+        const enqueueStart = Date.now();
+        await withSpan('queue.enqueue', { 'queue.name': CHECKOUT_QUEUE, 'order.id': orderId }, async () => {
+          try {
+            await checkoutQueue.add(
+              'checkout',
+              {
+                orderId: txResult.orderId,
+                items: input.items,
+                correlationId: input.correlationId,
+                _otel: injectContext(),
+              },
+              { jobId: txResult.orderId } // jobId = orderId garante idempotência no enqueue
+            );
+            await markOutboxPublished(txResult.outboxId);
+          } catch (err) {
+            log.error(
+              { err, orderId: txResult.orderId },
+              'enqueue failed; outbox event remains pending'
+            );
+          }
+        });
+        checkoutDuration.labels({ phase: 'enqueue' }).observe((Date.now() - enqueueStart) / 1000);
+
+        rootSpan.setAttribute('checkout.outcome', 'accepted');
+        checkoutStarted.inc();
+        log.info({ orderId: txResult.orderId, queue: CHECKOUT_QUEUE }, 'checkout accepted');
+        return { kind: 'accepted', orderId: txResult.orderId, status: 'pending', replay: false };
+      } catch (err) {
+        log.error({ err }, 'checkout processing failed; releasing idempotency key');
+        await releaseIdempotencyOnError(input.idempotencyKey);
+        throw err;
+      }
+    }
+  );
 }
 
 function replayResult(existing: IdempotencyRow): CheckoutResult {

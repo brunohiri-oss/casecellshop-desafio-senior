@@ -1,0 +1,40 @@
+feat(observability): spans manuais, propagacao OTel via fila, admin DLQ
+
+Tracing helpers (observability/tracing.ts):
+- withSpan(name, attrs, fn): wrapper que cuida de recordException + status
+  ERROR + end(); silencia erros de tipagem ao setar atributos undefined
+- injectContext()/extractContext(): serializa contexto W3C Trace Context
+  num carrier para anexar ao payload do job e propagar ao worker
+
+Cache (services/cache.ts):
+- getWithSingleFlight agora abre span 'cache.get' com cache.key, cache.status
+  (hit/miss/hit_after_wait), cache.lock (acquired/waiting/wait_timeout)
+- Sub-span 'cache.loader' quando carregamos da fonte original
+
+Checkout (services/checkout.ts):
+- Span raiz 'checkout.process' com idempotency.outcome, order.id,
+  checkout.outcome (accepted | rejected_<reason>) e item_count
+- Sub-spans: idempotency.claim, checkout.tx, stock.reserve, queue.enqueue
+- Metricas faltantes adicionadas: checkout_duration_seconds{phase=reserve_stock}
+  e checkout_duration_seconds{phase=enqueue}
+- Job payload agora carrega _otel com traceparent W3C
+
+Worker (workers/checkout-worker.ts):
+- Extrai _otel do job e usa otelContext.with(parentCtx) para garantir que
+  worker.process aparece como continuacao do MESMO traceId do request HTTP
+- Sub-spans: erp.invoice, orders.mark_confirmed
+- Atributos: order.id, queue.job_id, queue.attempt, erp.invoice_id
+
+Admin (routes/admin.ts):
+- GET /admin/dlq?limit=N: lista contents da DLQ para inspecao operacional
+  (primeira chamada do runbook quando dlq_size > 0)
+- POST /admin/queue/gauges/refresh: trigger manual de refresh dos gauges
+- Em producao requer auth dedicada (registrado no README como simplificacao)
+
+Validado E2E:
+- Trace de checkout aceito: 5 spans no API (idempotency.claim, stock.reserve,
+  checkout.tx, queue.enqueue, checkout.process) + 3 spans no worker
+  (erp.invoice, orders.mark_confirmed, worker.process), TODOS com o MESMO
+  traceId atravessando o limite assincrono BullMQ.
+- Trace de falha: ERP_FAILURE_RATE=1 -> 5 tentativas com backoff exp
+  (1+2+4+8+16=31s) -> order=failed -> DLQ size=1 com traceparent preservado.
