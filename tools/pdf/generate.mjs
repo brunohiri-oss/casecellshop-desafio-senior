@@ -35,11 +35,22 @@ const cover = `# Desafio Técnico CaseCellShop
 
 **Parte 1.A — Respostas Conceituais**
 
-**Candidato:** Bruno Hiri
+---
 
-**Repositório público (Parte 1.B):** <${REPO_URL}>
+### Candidato
 
-**Respostas online (markdown formatado):** <${REPO_URL}/blob/main/docs/RESPOSTAS.md>
+| | |
+|---|---|
+| **Nome** | Bruno Hiri |
+| **Email** | bruno.hiri@landtech.com.br |
+| **Telefone** | (11) 98682-4857 |
+
+### Entrega
+
+| | |
+|---|---|
+| **Repositório público (Parte 1.B)** | <${REPO_URL}> |
+| **Respostas online (markdown)** | <${REPO_URL}/blob/main/docs/RESPOSTAS.md> |
 
 <div class="pagebreak"></div>
 
