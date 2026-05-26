@@ -84,7 +84,11 @@ pnpm worker                         # consumidor da fila checkout
 pnpm test                           # 15 testes passam em ~7s
 ```
 
-Documentação interativa em **http://localhost:3000/docs** (Swagger UI alimentado pelo OpenAPI).
+Endpoints úteis:
+- API: http://localhost:3000 (Swagger UI em `/docs`, métricas em `/metrics`)
+- Worker: http://localhost:3001 (métricas em `/metrics`, health em `/health`)
+
+> Cada processo expõe seu próprio `/metrics` — em produção, o Prometheus tem dois scrape targets. O API mede o lado síncrono (cache, idempotência, http) e o worker mede o lado assíncrono (ERP, retries, checkout completion).
 
 ---
 
@@ -144,6 +148,8 @@ curl http://localhost:3000/admin/dlq
 ```bash
 pnpm test
 ```
+
+> A bateria roda contra o mesmo Postgres + Redis (compose). Cada `beforeEach` faz `fullReset` para isolamento; após a suíte, um `globalTeardown` restaura o catálogo canônico de 9 SKUs no DB, então `GET /products` continua exibindo o catálogo logo após `pnpm test` (sem precisar re-seedar).
 
 Saída esperada (resumida):
 ```

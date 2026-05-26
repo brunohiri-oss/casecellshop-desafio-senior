@@ -3,15 +3,18 @@ import { startTracing, stopTracing } from '../observability/tracing.js';
 startTracing();
 
 import { Worker, type Job } from 'bullmq';
+import { createServer } from 'node:http';
 import { CHECKOUT_QUEUE, checkoutDlq, refreshDlqGauge } from '../infra/queue.js';
 import { createBullConnection } from '../infra/redis.js';
 import { closeDb } from '../infra/db.js';
+import { env } from '../config/env.js';
 import { logger } from '../observability/logger.js';
 import {
   checkoutCompleted,
   checkoutDuration,
   queueRetries,
   queueJobsFailed,
+  registry,
 } from '../observability/metrics.js';
 import { invoiceOrder } from '../services/fake-erp.js';
 import { markOrderConfirmed, markOrderFailed } from '../repositories/orders.js';
@@ -23,6 +26,29 @@ interface CheckoutJobData {
   correlationId: string;
   _otel?: Record<string, string>;
 }
+
+// Sidecar HTTP server expondo /metrics do processo do worker.
+// Em produção, cada processo é scrape target separado no Prometheus —
+// API em :3000/metrics, worker em :3001/metrics. Cada processo tem sua
+// própria registry (counters/histograms são incrementados no processo
+// que efetivamente executou a operação).
+const metricsServer = createServer(async (req, res) => {
+  if (req.url === '/metrics' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': registry.contentType });
+    res.end(await registry.metrics());
+    return;
+  }
+  if (req.url === '/health' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ status: 'ok', role: 'worker' }));
+    return;
+  }
+  res.writeHead(404);
+  res.end();
+});
+metricsServer.listen(env.WORKER_METRICS_PORT, () => {
+  logger.info({ port: env.WORKER_METRICS_PORT }, 'worker metrics endpoint listening');
+});
 
 const worker = new Worker<CheckoutJobData>(
   CHECKOUT_QUEUE,
@@ -123,6 +149,7 @@ worker.on('failed', async (job, err) => {
 const shutdown = async (signal: string) => {
   logger.info({ signal }, 'worker shutting down');
   try {
+    await new Promise<void>((resolve) => metricsServer.close(() => resolve()));
     await worker.close();
     await closeDb();
     await stopTracing();

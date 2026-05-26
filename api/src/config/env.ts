@@ -3,6 +3,7 @@ import { z } from 'zod';
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(3000),
+  WORKER_METRICS_PORT: z.coerce.number().int().positive().default(3001),
   LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
   SERVICE_NAME: z.string().default('casecellshop-api'),
 
